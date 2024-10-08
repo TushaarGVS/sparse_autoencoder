@@ -2,7 +2,7 @@
 # the main purpose of this code is to provide a reference implementation to compare
 # against when implementing our training methodology into other codebases, and to
 # demonstrate how sharding/DP can be implemented for autoencoders. some limitations:
-# - many basic features (e.g checkpointing, data loading, validation) are not implemented,
+# - many basic features (e.g checkpointing, data loading, validation) aren't implemented,
 # - the codebase is not designed to be extensible or easily hackable.
 # - this code is not guaranteed to run efficiently out of the box / in
 #   combination with other changes, so you should profile it and make changes as needed.
@@ -11,9 +11,11 @@
 #    torchrun --nproc-per-node 8 train.py
 
 
+import glob
 import os
+import random
 from dataclasses import dataclass
-from typing import Callable, Iterable, Iterator
+from typing import Callable, Iterable, Iterator, List, Literal
 
 import torch
 import torch.distributed as dist
@@ -21,8 +23,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from sparse_autoencoder.kernels import *
 from torch.distributed import ReduceOp
+
+from openai_sparse_autoencoder.kernels import *
 
 RANK = int(os.environ.get("RANK", "0"))
 
@@ -106,7 +109,7 @@ class ShardingComms:
                         n_op_shards=self.n_op_shards,
                     ),
                 )
-        
+
         if self.sh_comm is not None:
             # pre_bias is the same across all shards
             self.sh_comm.broadcast(
@@ -124,7 +127,9 @@ class ShardingComms:
 
         for param in autoencoder.parameters():
             if param.grad is not None:
-                self.dp_comm.all_reduce(maybe_transpose(param.grad), op=ReduceOp.AVG, async_op=True)
+                self.dp_comm.all_reduce(
+                    maybe_transpose(param.grad), op=ReduceOp.AVG, async_op=True
+                )
 
         # make sure statistics for dead neurons are correct
         self.dp_comm.all_reduce(  # type: ignore
@@ -137,7 +142,9 @@ class ShardingComms:
 
         if hasattr(scaler, "_scale") and scaler._scale is not None:
             self.sh_comm.all_reduce(scaler._scale, op=ReduceOp.MIN, async_op=True)
-            self.sh_comm.all_reduce(scaler._growth_tracker, op=ReduceOp.MIN, async_op=True)
+            self.sh_comm.all_reduce(
+                scaler._growth_tracker, op=ReduceOp.MIN, async_op=True
+            )
 
     def _sh_comm_op(self, x, op):
         if isinstance(x, (float, int)):
@@ -196,17 +203,24 @@ def make_torch_comms(n_op_shards=4, n_replicas=2):
     my_op_shard_idx = rank % n_op_shards
     my_replica_idx = rank // n_op_shards
 
-    shard_rank_lists = [list(range(i, i + n_op_shards)) for i in range(0, world_size, n_op_shards)]
+    shard_rank_lists = [
+        list(range(i, i + n_op_shards)) for i in range(0, world_size, n_op_shards)
+    ]
 
-    shard_groups = [dist.new_group(shard_rank_list) for shard_rank_list in shard_rank_lists]
+    shard_groups = [
+        dist.new_group(shard_rank_list) for shard_rank_list in shard_rank_lists
+    ]
 
     my_shard_group = shard_groups[my_replica_idx]
 
     replica_rank_lists = [
-        list(range(i, n_op_shards * n_replicas, n_op_shards)) for i in range(n_op_shards)
+        list(range(i, n_op_shards * n_replicas, n_op_shards))
+        for i in range(n_op_shards)
     ]
 
-    replica_groups = [dist.new_group(replica_rank_list) for replica_rank_list in replica_rank_lists]
+    replica_groups = [
+        dist.new_group(replica_rank_list) for replica_rank_list in replica_rank_lists
+    ]
 
     my_replica_group = replica_groups[my_op_shard_idx]
 
@@ -257,7 +271,9 @@ def sharded_topk(x, k, sh_comm, capacity_factor=None):
     if sh_comm is None:
         return inds, vals
 
-    all_vals = torch.empty(sh_comm.size(), batch, k_in, dtype=vals.dtype, device=vals.device)
+    all_vals = torch.empty(
+        sh_comm.size(), batch, k_in, dtype=vals.dtype, device=vals.device
+    )
     sh_comm.all_gather(all_vals, vals, async_op=True)
 
     all_vals = all_vals.permute(1, 0, 2)  # put shard dim next to k
@@ -310,7 +326,9 @@ class FastAutoencoder(nn.Module):
         self.latent_bias = nn.Parameter(torch.zeros(n_dirs_local))
 
         self.stats_last_nonzero: torch.Tensor
-        self.register_buffer("stats_last_nonzero", torch.zeros(n_dirs_local, dtype=torch.long))
+        self.register_buffer(
+            "stats_last_nonzero", torch.zeros(n_dirs_local, dtype=torch.long)
+        )
 
         def auxk_mask_fn(x):
             dead_mask = self.stats_last_nonzero > dead_steps_threshold
@@ -397,7 +415,9 @@ class FastAutoencoder(nn.Module):
                     all_inds = inds
                     all_grad_vals = grad_vals
 
-                grad_sum = torch.zeros(self.n_dirs_local, dtype=torch.float32, device=grad_vals.device)
+                grad_sum = torch.zeros(
+                    self.n_dirs_local, dtype=torch.float32, device=grad_vals.device
+                )
                 grad_sum.scatter_add_(
                     -1, all_inds.flatten(), all_grad_vals.flatten().to(torch.float32)
                 )
@@ -406,7 +426,9 @@ class FastAutoencoder(nn.Module):
                     None,
                     # pre_bias grad optimization - can reduce before mat-vec multiply
                     -(grad_sum @ weight),
-                    triton_sparse_transpose_dense_matmul(all_inds, all_grad_vals, x, N=self.n_dirs_local),
+                    triton_sparse_transpose_dense_matmul(
+                        all_inds, all_grad_vals, x, N=self.n_dirs_local
+                    ),
                     grad_sum,
                 )
 
@@ -443,13 +465,18 @@ def unit_norm_decoder_(autoencoder: FastAutoencoder) -> None:
 
 
 def unit_norm_decoder_grad_adjustment_(autoencoder) -> None:
-    """project out gradient information parallel to the dictionary vectors - assumes that the decoder is already unit normed"""
+    """
+    project out gradient information parallel to the dictionary vectors - assumes 
+    that the decoder is already unit normed
+    """
 
     assert autoencoder.decoder.weight.grad is not None
 
     triton_add_mul_(
         autoencoder.decoder.weight.grad,
-        torch.einsum("bn,bn->n", autoencoder.decoder.weight.data, autoencoder.decoder.weight.grad),
+        torch.einsum(
+            "bn,bn->n", autoencoder.decoder.weight.data, autoencoder.decoder.weight.grad
+        ),
         autoencoder.decoder.weight.data,
         c=-1,
     )
@@ -523,6 +550,52 @@ def batch_tensors(
         yield torch.cat(tensors, dim=0)
 
 
+def batch_activations(
+    act_filenames: List[str],
+    batch_size: int,
+    layer_num: int = 30,
+    act_type: Literal["mlp_activation", "rg_lru_states"] = "rg_lru_states",
+    stream: torch.cuda.Stream = None,
+    drop_last: bool = False,
+):
+    """
+    Returns flat activations of (batch, d_model) in streaming mode.
+
+    RecurrentGemma 9b-it (input_ids, rg_lru_states, mlp_activations):
+    - rnn layers: 0, 30
+    - attention layers: 2, 29 (= rg_lru is none)
+    """
+    tensors: List[at.Fl("bl d")] = []
+    running_batch_len = 0
+    for filename in act_filenames:
+        try:
+            act_dict = pickle.load(gzip.open(filename, "rb"))
+        except:
+            continue
+        batch_act_list: List[at.Fl("l d")] = act_dict[f"blocks.{layer_num}"][act_type]
+        tensors.extend(batch_act_list)
+        running_batch_len += sum(batch_act.shape[0] for batch_act in batch_act_list)
+        if running_batch_len < batch_size:
+            continue
+
+        while running_batch_len >= batch_size:
+            if len(tensors) == 1:
+                concat = tensors[0]
+            else:
+                with torch.cuda.stream(stream):
+                    concat = torch.cat(tensors, dim=0)
+
+            offset = 0
+            while offset + batch_size <= concat.shape[0]:
+                yield concat[offset : offset + batch_size]
+                running_batch_len -= batch_size
+                offset += batch_size
+            tensors = [concat[offset:]] if offset < concat.shape[0] else []
+
+    if len(tensors) > 0 and not drop_last:
+        yield torch.cat(tensors, dim=0)
+
+
 def print0(*a, **k):
     if RANK == 0:
         print(*a, **k)
@@ -536,9 +609,7 @@ class Logger:
         self.vals = {}
         self.enabled = (RANK == 0) and not kws.pop("dummy", False)
         if self.enabled:
-            wandb.init(
-                **kws
-            )
+            wandb.init(**kws)
 
     def logkv(self, k, v):
         if self.enabled:
@@ -551,8 +622,17 @@ class Logger:
             self.vals = {}
 
 
-def training_loop_(
-    ae, train_acts_iter, loss_fn, lr, comms, eps=6.25e-10, clip_grad=None, ema_multiplier=0.999, logger=None
+def training_eval_loop_(
+    ae,
+    train_acts_iter,
+    val_acts_iter,
+    loss_fn,
+    lr,
+    comms,
+    eps=6.25e-10,
+    clip_grad=None,
+    ema_multiplier=0.999,
+    logger=None,
 ):
     if logger is None:
         logger = Logger(dummy=True)
@@ -567,17 +647,26 @@ def training_loop_(
     for i, flat_acts_train_batch in enumerate(train_acts_iter):
         flat_acts_train_batch = flat_acts_train_batch.cuda()
 
+        ae.train()
         with autocast_ctx_manager:
             recons, info = ae(flat_acts_train_batch)
-
             loss = loss_fn(ae, flat_acts_train_batch, recons, info, logger)
 
-        print0(i, loss)
+        print0(f"train-{i}", loss)
+        frac_neurons_dead = (
+            torch.sum(ae.stats_last_nonzero > ae.dead_steps_threshold).item()
+            / ae.n_dirs
+        )
 
         logger.logkv("loss_scale", scaler.get_scale())
 
         if RANK == 0:
-            wandb.log({"train_loss": loss.item()})
+            wandb.log(
+                {
+                    "train_loss": loss.item(),
+                    "train_frac_neurons_dead": frac_neurons_dead.item(),
+                }
+            )
 
         loss = scaler.scale(loss)
         loss.backward()
@@ -591,7 +680,8 @@ def training_loop_(
         # keep fp16 loss scale synchronized across shards
         comms.sh_allreduce_scale(scaler)
 
-        # if you want to do anything with the gradients that depends on the absolute scale (e.g clipping, do it after the unscale_)
+        # if you want to do anything with the gradients that depends on the absolute
+        # scale (e.g clipping, do it after the unscale_)
         scaler.unscale_(opt)
 
         # gradient clipping
@@ -599,7 +689,9 @@ def training_loop_(
             grad_norm = sharded_grad_norm(ae, comms)
             logger.logkv("grad_norm", grad_norm)
             grads = [x.grad for x in ae.parameters() if x.grad is not None]
-            torch._foreach_mul_(grads, clip_grad / torch.clamp(grad_norm, min=clip_grad))
+            torch._foreach_mul_(
+                grads, clip_grad / torch.clamp(grad_norm, min=clip_grad)
+            )
 
         if ema_multiplier is not None:
             ema.step()
@@ -607,19 +699,88 @@ def training_loop_(
         # take step with optimizer
         scaler.step(opt)
         scaler.update()
-        
+
+        if i % 100 == 0:
+            ae.eval()
+            val_loss_vals, val_frac_neurons_dead_vals = [], []
+            with torch.inference_mode():
+                for flat_acts_val_batch in val_acts_iter:
+                    flat_acts_val_batch = flat_acts_val_batch.cuda()
+                    with autocast_ctx_manager:
+                        val_recons, val_info = ae(flat_acts_val_batch.cuda())
+                        val_loss = loss_fn(
+                            ae, flat_acts_val_batch, val_recons, val_info, logger
+                        ).item()
+                        frac_neurons_dead = (
+                            torch.sum(
+                                ae.stats_last_nonzero > ae.dead_steps_threshold
+                            ).item()
+                            / ae.n_dirs
+                        )
+                        val_loss_vals.append(val_loss)
+                        val_frac_neurons_dead_vals.append(frac_neurons_dead)
+
+            val_loss = torch.tensor(val_loss_vals).mean()
+            val_frac_neurons_dead_vals = torch.tensor(val_frac_neurons_dead_vals).mean()
+            print0(f"val-{i}", val_loss)
+            if RANK == 0:
+                wandb.log(
+                    {
+                        "val_loss": val_loss.item(),
+                        "val_frac_neurons_dead": val_frac_neurons_dead_vals.item(),
+                    }
+                )
+                # Save after all metrics have been logged and validation done.
+                torch.save(ae.state_dict(), f"artefacts/sae.ckpt{i}.pt")
+
         logger.dumpkvs()
+
+    ############################################################################
+    # Evaluate once after full training.
+    ############################################################################
+    ae.eval()
+    val_loss_vals, val_frac_neurons_dead_vals = [], []
+    with torch.inference_mode():
+        for flat_acts_val_batch in val_acts_iter:
+            flat_acts_val_batch = flat_acts_val_batch.cuda()
+            with autocast_ctx_manager:
+                val_recons, val_info = ae(flat_acts_val_batch.cuda())
+                val_loss = loss_fn(
+                    ae, flat_acts_val_batch, val_recons, val_info, logger
+                ).item()
+                frac_neurons_dead = (
+                    torch.sum(ae.stats_last_nonzero > ae.dead_steps_threshold).item()
+                    / ae.n_dirs
+                )
+                val_loss_vals.append(val_loss)
+                val_frac_neurons_dead_vals.append(frac_neurons_dead)
+
+    val_loss = torch.tensor(val_loss_vals).mean()
+    val_frac_neurons_dead_vals = torch.tensor(val_frac_neurons_dead_vals).mean()
+    print0(f"val-final", val_loss)
+    if RANK == 0:
+        wandb.log(
+            {
+                "val_loss": val_loss.item(),
+                "val_frac_neurons_dead": val_frac_neurons_dead_vals.item(),
+            }
+        )
+        torch.save(ae.state_dict(), f"artefacts/sae.pt")
 
 
 def init_from_data_(ae, stats_acts_sample, comms):
     from geom_median.torch import compute_geometric_median
 
     ae.pre_bias.data = (
-        compute_geometric_median(stats_acts_sample[:32768].float().cpu()).median.cuda().float()
+        compute_geometric_median(stats_acts_sample[:32_768].float().cpu())
+        .median.cuda()
+        .float()
     )
     comms.all_broadcast(ae.pre_bias.data)
 
-    # encoder initialization (note: in our ablations we couldn't find clear evidence that this is beneficial, this is just to ensure exact match with internal codebase)
+    # encoder initialization (note: in our ablations we couldn't find clear evidence
+    # that this is beneficial, this is just to ensure exact match with internal
+    # codebase)
     d_model = ae.d_model
     with torch.no_grad():
         x = torch.randn(256, d_model).cuda().to(stats_acts_sample.dtype)
@@ -654,7 +815,9 @@ class EmaModel:
     def __init__(self, model, ema_multiplier):
         self.model = model
         self.ema_multiplier = ema_multiplier
-        self.ema_weights = [torch.zeros_like(x, requires_grad=False) for x in model.parameters()]
+        self.ema_weights = [
+            torch.zeros_like(x, requires_grad=False) for x in model.parameters()
+        ]
         self.ema_steps = 0
 
     def step(self):
@@ -672,7 +835,9 @@ class EmaModel:
 
         # apply bias correction
         bias_correction = 1 - self.ema_multiplier**self.ema_steps
-        ema_weights_bias_corrected = torch._foreach_div(self.ema_weights, bias_correction)
+        ema_weights_bias_corrected = torch._foreach_div(
+            self.ema_weights, bias_correction
+        )
 
         with torch.no_grad():
             with temporary_weight_swap(self.model, ema_weights_bias_corrected):
@@ -684,9 +849,9 @@ class Config:
     n_op_shards: int = 1
     n_replicas: int = 8
 
-    n_dirs: int = 32768
-    bs: int = 131072
-    d_model: int = 768
+    n_dirs: int = 32 * 4_096
+    bs: int = 16_384
+    d_model: int = 4_096
     k: int = 32
     auxk: int = 256
 
@@ -696,18 +861,43 @@ class Config:
     auxk_coef: float = 1 / 32
     dead_toks_threshold: int = 10_000_000
     ema_multiplier: float | None = None
-    
-    wandb_project: str | None = None
-    wandb_name: str | None = None
+
+    wandb_project: str | None = "openai-sae"
+    wandb_name: str | None = "xyznlp"
+
+    variant = "9b"
+    data: str = "minipile-110K"
+    layer_num: int = 30
+    activation_type: Literal["mlp", "rg_lru"] = "rg_lru"
+
+
+@dataclass
+class TrainingCfg:
+    seed: int = 4740
+    eval_split: float = 0.01
 
 
 def main():
     cfg = Config()
     comms = make_torch_comms(n_op_shards=cfg.n_op_shards, n_replicas=cfg.n_replicas)
 
-    ## dataloading is left as an exercise for the reader
-    acts_iter = ...
-    stats_acts_sample = ...
+    training_cfg = TrainingCfg()
+    activations_dir = (f"/share/rush/tg352/sae/minipile/{cfg.variant}/artefacts",)
+    activation_filenames = glob.glob(f"{glob.escape(activations_dir)}/*.pkl.gz")
+    random.Random(training_cfg.seed).shuffle(activation_filenames)
+    num_val_files = int(len(activation_filenames) * training_cfg.eval_split)
+
+    stats_acts_sample = next(
+        batch_activations(
+            act_filenames=activation_filenames[num_val_files:],
+            batch_size=32_768,
+            layer_num=cfg.layer_num,
+            act_type=cfg.activation_type,
+            stream=None,
+            drop_last=False,
+        )
+    )
+    print(f"{stats_acts_sample.shape=}")
 
     n_dirs_local = cfg.n_dirs // cfg.n_op_shards
     bs_local = cfg.bs // cfg.n_replicas
@@ -726,8 +916,12 @@ def main():
     comms.init_broadcast_(ae)
 
     mse_scale = (
-        1 / ((stats_acts_sample.float().mean(dim=0) - stats_acts_sample.float()) ** 2).mean()
+        1
+        / (
+            (stats_acts_sample.float().mean(dim=0) - stats_acts_sample.float()) ** 2
+        ).mean()
     )
+    print(f"{mse_scale=}")
     comms.all_broadcast(mse_scale)
     mse_scale = mse_scale.item()
 
@@ -737,14 +931,25 @@ def main():
         dummy=cfg.wandb_project is None,
     )
 
-    training_loop_(
+    training_eval_loop_(
         ae,
-        batch_tensors(
-            acts_iter,
-            bs_local,
-            drop_last=True,
+        train_acts_iter=batch_activations(
+            act_filenames=activation_filenames[num_val_files:],
+            batch_size=bs_local,
+            layer_num=cfg.layer_num,
+            act_type=cfg.activation_type,
+            stream=None,
+            drop_last=False,
         ),
-        lambda ae, flat_acts_train_batch, recons, info, logger: (
+        val_acts_iter=batch_activations(
+            act_filenames=activation_filenames[:num_val_files],
+            batch_size=bs_local,
+            layer_num=cfg.layer_num,
+            act_type=cfg.activation_type,
+            stream=None,
+            drop_last=False,
+        ),
+        loss_fn=lambda ae, flat_acts_train_batch, recons, info, logger: (
             # MSE
             logger.logkv("train_recons", mse_scale * mse(recons, flat_acts_train_batch))
             # AuxK

@@ -1,5 +1,5 @@
 [project]
-name = "sparse_autoencoder"
+name = "openai_sparse_autoencoder"
 description="Sparse autoencoder for GPT2"
 version = "0.1"
 authors = [{name = "OpenAI"}]
