@@ -12,9 +12,12 @@
 
 
 import glob
+import gzip
 import os
+import pickle
 import random
 from dataclasses import dataclass
+from functools import partial
 from typing import Callable, Iterable, Iterator, List, Literal
 
 import torch
@@ -259,7 +262,7 @@ TRIVIAL_COMMS = ShardingComms(
 def sharded_topk(x, k, sh_comm, capacity_factor=None):
     batch = x.shape[0]
 
-    if capacity_factor is not None:
+    if capacity_factor is not None and sh_comm is not None:
         k_in = min(int(k * capacity_factor // sh_comm.size()), k)
     else:
         k_in = k
@@ -466,7 +469,7 @@ def unit_norm_decoder_(autoencoder: FastAutoencoder) -> None:
 
 def unit_norm_decoder_grad_adjustment_(autoencoder) -> None:
     """
-    project out gradient information parallel to the dictionary vectors - assumes 
+    project out gradient information parallel to the dictionary vectors - assumes
     that the decoder is already unit normed
     """
 
@@ -565,14 +568,14 @@ def batch_activations(
     - rnn layers: 0, 30
     - attention layers: 2, 29 (= rg_lru is none)
     """
-    tensors: List[at.Fl("bl d")] = []
+    tensors = []
     running_batch_len = 0
     for filename in act_filenames:
         try:
             act_dict = pickle.load(gzip.open(filename, "rb"))
         except:
             continue
-        batch_act_list: List[at.Fl("l d")] = act_dict[f"blocks.{layer_num}"][act_type]
+        batch_act_list = act_dict[f"blocks.{layer_num}"][act_type]
         tensors.extend(batch_act_list)
         running_batch_len += sum(batch_act.shape[0] for batch_act in batch_act_list)
         if running_batch_len < batch_size:
@@ -624,8 +627,9 @@ class Logger:
 
 def training_eval_loop_(
     ae,
-    train_acts_iter,
-    val_acts_iter,
+    acts_iter_fn,
+    activation_filenames,
+    num_val_files,
     loss_fn,
     lr,
     comms,
@@ -644,6 +648,7 @@ def training_eval_loop_(
     if ema_multiplier is not None:
         ema = EmaModel(ae, ema_multiplier=ema_multiplier)
 
+    train_acts_iter = acts_iter_fn(activation_filenames[num_val_files:])
     for i, flat_acts_train_batch in enumerate(train_acts_iter):
         flat_acts_train_batch = flat_acts_train_batch.cuda()
 
@@ -664,7 +669,7 @@ def training_eval_loop_(
             wandb.log(
                 {
                     "train_loss": loss.item(),
-                    "train_frac_neurons_dead": frac_neurons_dead.item(),
+                    "train_frac_neurons_dead": frac_neurons_dead,
                 }
             )
 
@@ -700,10 +705,11 @@ def training_eval_loop_(
         scaler.step(opt)
         scaler.update()
 
-        if i % 100 == 0:
+        if i % 500 == 0:
             ae.eval()
-            val_loss_vals, val_frac_neurons_dead_vals = [], []
             with torch.inference_mode():
+                val_acts_iter = acts_iter_fn(activation_filenames[:num_val_files])
+                val_loss_vals, val_frac_neurons_dead_vals = [], []
                 for flat_acts_val_batch in val_acts_iter:
                     flat_acts_val_batch = flat_acts_val_batch.cuda()
                     with autocast_ctx_manager:
@@ -726,10 +732,12 @@ def training_eval_loop_(
             if RANK == 0:
                 wandb.log(
                     {
-                        "val_loss": val_loss.item(),
-                        "val_frac_neurons_dead": val_frac_neurons_dead_vals.item(),
+                        "val_loss": val_loss,
+                        "val_frac_neurons_dead": val_frac_neurons_dead_vals,
                     }
                 )
+        if i % 1000 == 0:
+            if RANK == 0:
                 # Save after all metrics have been logged and validation done.
                 torch.save(ae.state_dict(), f"artefacts/sae.ckpt{i}.pt")
 
@@ -739,8 +747,9 @@ def training_eval_loop_(
     # Evaluate once after full training.
     ############################################################################
     ae.eval()
-    val_loss_vals, val_frac_neurons_dead_vals = [], []
     with torch.inference_mode():
+        val_acts_iter = acts_iter_fn(activation_filenames[:num_val_files])
+        val_loss_vals, val_frac_neurons_dead_vals = [], []
         for flat_acts_val_batch in val_acts_iter:
             flat_acts_val_batch = flat_acts_val_batch.cuda()
             with autocast_ctx_manager:
@@ -761,8 +770,8 @@ def training_eval_loop_(
     if RANK == 0:
         wandb.log(
             {
-                "val_loss": val_loss.item(),
-                "val_frac_neurons_dead": val_frac_neurons_dead_vals.item(),
+                "val_loss": val_loss,
+                "val_frac_neurons_dead": val_frac_neurons_dead_vals,
             }
         )
         torch.save(ae.state_dict(), f"artefacts/sae.pt")
@@ -847,7 +856,7 @@ class EmaModel:
 @dataclass
 class Config:
     n_op_shards: int = 1
-    n_replicas: int = 8
+    n_replicas: int = 1
 
     n_dirs: int = 32 * 4_096
     bs: int = 16_384
@@ -868,7 +877,7 @@ class Config:
     variant = "9b"
     data: str = "minipile-110K"
     layer_num: int = 30
-    activation_type: Literal["mlp", "rg_lru"] = "rg_lru"
+    activation_type: Literal["mlp_activation", "rg_lru_states"] = "rg_lru_states"
 
 
 @dataclass
@@ -882,7 +891,7 @@ def main():
     comms = make_torch_comms(n_op_shards=cfg.n_op_shards, n_replicas=cfg.n_replicas)
 
     training_cfg = TrainingCfg()
-    activations_dir = (f"/share/rush/tg352/sae/minipile/{cfg.variant}/artefacts",)
+    activations_dir = f"/share/rush/tg352/sae/minipile/{cfg.variant}/artefacts"
     activation_filenames = glob.glob(f"{glob.escape(activations_dir)}/*.pkl.gz")
     random.Random(training_cfg.seed).shuffle(activation_filenames)
     num_val_files = int(len(activation_filenames) * training_cfg.eval_split)
@@ -896,7 +905,7 @@ def main():
             stream=None,
             drop_last=False,
         )
-    )
+    ).cuda()
     print(f"{stats_acts_sample.shape=}")
 
     n_dirs_local = cfg.n_dirs // cfg.n_op_shards
@@ -931,24 +940,19 @@ def main():
         dummy=cfg.wandb_project is None,
     )
 
+    acts_iter_fn = partial(
+        batch_activations,
+        batch_size=bs_local,
+        layer_num=cfg.layer_num,
+        act_type=cfg.activation_type,
+        stream=None,
+        drop_last=False,
+    )
     training_eval_loop_(
         ae,
-        train_acts_iter=batch_activations(
-            act_filenames=activation_filenames[num_val_files:],
-            batch_size=bs_local,
-            layer_num=cfg.layer_num,
-            act_type=cfg.activation_type,
-            stream=None,
-            drop_last=False,
-        ),
-        val_acts_iter=batch_activations(
-            act_filenames=activation_filenames[:num_val_files],
-            batch_size=bs_local,
-            layer_num=cfg.layer_num,
-            act_type=cfg.activation_type,
-            stream=None,
-            drop_last=False,
-        ),
+        acts_iter_fn=acts_iter_fn,
+        activation_filenames=activation_filenames,
+        num_val_files=num_val_files,
         loss_fn=lambda ae, flat_acts_train_batch, recons, info, logger: (
             # MSE
             logger.logkv("train_recons", mse_scale * mse(recons, flat_acts_train_batch))

@@ -15,4 +15,4 @@ requires = ["setuptools>=64.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["sparse_autoencoder*"]
+include = ["openai_sparse_autoencoder*"]
