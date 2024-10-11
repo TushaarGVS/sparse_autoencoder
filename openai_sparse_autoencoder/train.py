@@ -459,6 +459,22 @@ class FastAutoencoder(nn.Module):
 
         return recons + self.pre_bias
 
+    @torch.inference_mode
+    @torch.no_grad
+    def encode(self, x, k: int = None):
+        if k is None:
+            k = self.k
+
+        x = x - self.pre_bias
+        latents_pre_act = F.linear(x, self.encoder.weight, self.latent_bias)
+        inds, vals = sharded_topk(
+            latents_pre_act,
+            k=k,
+            sh_comm=self.comms.sh_comm,
+            capacity_factor=4,
+        )
+        return inds, vals
+
 
 def unit_norm_decoder_(autoencoder: FastAutoencoder) -> None:
     """
@@ -884,6 +900,7 @@ class Config:
 class TrainingCfg:
     seed: int = 4740
     eval_split: float = 0.01
+    ckpt: str | None = "artefacts/sae.ep1.pt"
 
 
 def main():
@@ -920,7 +937,14 @@ def main():
         comms=comms,
     )
     ae.cuda()
-    init_from_data_(ae, stats_acts_sample, comms)
+    if training_cfg.ckpt is not None:
+        ae.load_state_dict(
+            torch.load(
+                training_cfg.ckpt, map_location=torch.device("cuda"), weights_only=True
+            )
+        )
+    else:
+        init_from_data_(ae, stats_acts_sample, comms)
     # IMPORTANT: make sure all DP ranks have the same params
     comms.init_broadcast_(ae)
 
